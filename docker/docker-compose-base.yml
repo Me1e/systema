@@ -27,7 +27,7 @@ services:
         soft: -1
         hard: -1
     healthcheck:
-      test: ["CMD-SHELL", "curl http://localhost:9200"]
+      test: ['CMD-SHELL', 'curl http://localhost:9200']
       interval: 10s
       timeout: 10s
       retries: 120
@@ -65,7 +65,7 @@ services:
         soft: -1
         hard: -1
     healthcheck:
-      test: ["CMD-SHELL", "curl http://localhost:9201"]
+      test: ['CMD-SHELL', 'curl http://localhost:9201']
       interval: 10s
       timeout: 10s
       retries: 120
@@ -81,7 +81,7 @@ services:
     volumes:
       - infinity_data:/var/infinity
       - ./infinity_conf.toml:/infinity_conf.toml
-    command: ["-f", "/infinity_conf.toml"]
+    command: ['-f', '/infinity_conf.toml']
     ports:
       - ${INFINITY_THRIFT_PORT}:23817
       - ${INFINITY_HTTP_PORT}:23820
@@ -97,40 +97,32 @@ services:
     networks:
       - ragflow
     healthcheck:
-      test: ["CMD", "curl", "http://localhost:23820/admin/node/current"]
+      test: ['CMD', 'curl', 'http://localhost:23820/admin/node/current']
       interval: 10s
       timeout: 10s
       retries: 120
     restart: on-failure
 
   sandbox-executor-manager:
-    container_name: ragflow-sandbox-executor-manager
-    profiles:
-      - sandbox
-    image: ${SANDBOX_EXECUTOR_MANAGER_IMAGE-infiniflow/sandbox-executor-manager:latest}
-    privileged: true
+    build:
+      context: ../sandbox/executor_manager
+      dockerfile: Dockerfile
+    image: sandbox-executor-manager:latest
+    container_name: sandbox-executor-manager
     ports:
-      - ${SANDBOX_EXECUTOR_MANAGER_PORT-9385}:9385
-    env_file: .env
+      - '9385:9385'
+    environment:
+      - EXECUTOR_ENDPOINT=http://sandbox-executor-manager:9385
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
-    networks:
-      - ragflow
-    security_opt:
-      - no-new-privileges:true
-    environment:
-      - TZ=${TIMEZONE}
-      - SANDBOX_EXECUTOR_MANAGER_POOL_SIZE=${SANDBOX_EXECUTOR_MANAGER_POOL_SIZE:-3}
-      - SANDBOX_BASE_PYTHON_IMAGE=${SANDBOX_BASE_PYTHON_IMAGE:-infiniflow/sandbox-base-python:latest}
-      - SANDBOX_BASE_NODEJS_IMAGE=${SANDBOX_BASE_NODEJS_IMAGE:-infiniflow/sandbox-base-nodejs:latest}
-      - SANDBOX_ENABLE_SECCOMP=${SANDBOX_ENABLE_SECCOMP:-false}
-      - SANDBOX_MAX_MEMORY=${SANDBOX_MAX_MEMORY:-256m}
-      - SANDBOX_TIMEOUT=${SANDBOX_TIMEOUT:-10s}
+      - ../sandbox/executor_manager:/app
     healthcheck:
-      test: ["CMD", "curl", "http://localhost:9385/healthz"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
+      test: ['CMD', 'curl', '-f', 'http://localhost:9385/health']
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    networks:
+      - ragflow_network
     restart: on-failure
 
   mysql:
@@ -141,8 +133,7 @@ services:
     environment:
       - MYSQL_ROOT_PASSWORD=${MYSQL_PASSWORD}
       - TZ=${TIMEZONE}
-    command:
-      --max_connections=1000
+    command: --max_connections=1000
       --character-set-server=utf8mb4
       --collation-server=utf8mb4_unicode_ci
       --default-authentication-plugin=mysql_native_password
@@ -157,7 +148,7 @@ services:
     networks:
       - ragflow
     healthcheck:
-      test: ["CMD", "mysqladmin" ,"ping", "-uroot", "-p${MYSQL_PASSWORD}"]
+      test: ['CMD', 'mysqladmin', 'ping', '-uroot', '-p${MYSQL_PASSWORD}']
       interval: 10s
       timeout: 10s
       retries: 3
@@ -181,7 +172,7 @@ services:
       - ragflow
     restart: on-failure
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      test: ['CMD', 'curl', '-f', 'http://localhost:9000/minio/health/live']
       interval: 30s
       timeout: 20s
       retries: 3
@@ -200,13 +191,11 @@ services:
       - ragflow
     restart: on-failure
     healthcheck:
-      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "ping"]
+      test: ['CMD', 'redis-cli', '-a', '${REDIS_PASSWORD}', 'ping']
       interval: 5s
       timeout: 3s
       retries: 3
-      start_period: 10s    
-
-
+      start_period: 10s
 
 volumes:
   esdata01:
@@ -224,4 +213,6 @@ volumes:
 
 networks:
   ragflow:
+    driver: bridge
+  ragflow_network:
     driver: bridge

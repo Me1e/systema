@@ -5,7 +5,7 @@ RUN grep -rl 'deb.debian.org' /etc/apt/ | xargs sed -i 's|http[s]*://deb.debian.
     apt-get install -y curl gcc && \
     rm -rf /var/lib/apt/lists/*
 
-RUN curl -fsSL https://mirrors.aliyun.com/docker-ce/linux/static/stable/x86_64/docker-24.0.7.tgz -o docker.tgz && \
+RUN curl -fsSL https://download.docker.com/linux/static/stable/x86_64/docker-27.0.3.tgz -o docker.tgz && \
     tar -xzf docker.tgz && \
     mv docker/docker /usr/bin/docker && \
     rm -rf docker docker.tgz
@@ -17,7 +17,7 @@ ENV UV_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
 WORKDIR /app
 COPY . .
 
-RUN uv pip install --system -r requirements.txt
+RUN uv pip install --system -r /app/requirements.txt
 
 CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "9385"]
 
