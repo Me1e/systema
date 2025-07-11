@@ -223,6 +223,16 @@ class AzureGptV4(Base):
         return res.choices[0].message.content.strip(), res.usage.total_tokens
 
 
+class xAICV(Base):
+    _FACTORY_NAME = "xAI"
+
+    def __init__(self, key, model_name="grok-3", base_url=None, **kwargs):
+        if not base_url:
+            base_url = "https://api.x.ai/v1"
+        super().__init__(key, model_name, base_url=base_url, **kwargs)
+        return
+
+
 class QWenCV(Base):
     _FACTORY_NAME = "Tongyi-Qianwen"
 
@@ -656,15 +666,9 @@ class GeminiCV(Base):
         from PIL.Image import open
 
         b64 = self.image2base64(image)
-        # For Gemini, we need just the text prompt, not the OpenAI-style structure
-        if prompt:
-            prompt_text = prompt
-        else:
-            from rag.prompts import vision_llm_describe_prompt
-            prompt_text = vision_llm_describe_prompt()
-        
+        vision_prompt = prompt if prompt else vision_llm_describe_prompt()
         img = open(BytesIO(base64.b64decode(b64)))
-        input = [prompt_text, img]
+        input = [vision_prompt, img]
         res = self.model.generate_content(input)
         
         # Safely extract text from response
