@@ -20,6 +20,10 @@ from rag.llm.chat_model import Base as CompletionLLM
 from graphrag.utils import perform_variable_replacements, dict_has_keys_with_types, chat_limiter
 from rag.utils import num_tokens_from_string
 import trio
+import os
+
+# Community-specific limiter for more conservative concurrent requests
+community_limiter = trio.CapacityLimiter(int(os.environ.get('MAX_CONCURRENT_COMMUNITIES', 3)))
 
 
 @dataclass
@@ -64,6 +68,8 @@ class CommunityReportsExtractor(Extractor):
             ents = cm["nodes"]
             if len(ents) < 2:
                 return
+            
+            # Prepare data
             ent_list = [{"entity": ent, "description": graph.nodes[ent]["description"]} for ent in ents]
             ent_df = pd.DataFrame(ent_list)
 
@@ -88,51 +94,122 @@ class CommunityReportsExtractor(Extractor):
             }
             text = perform_variable_replacements(self._extraction_prompt, variables=prompt_variables)
             gen_conf = {"temperature": 0.3}
-            async with chat_limiter:
+            
+            # Enhanced retry logic for API errors
+            max_retries = 3
+            for attempt in range(max_retries):
                 try:
-                    with trio.move_on_after(120) as cancel_scope:
-                        response = await trio.to_thread.run_sync( self._chat, text, [{"role": "user", "content": "Output:"}], gen_conf)
-                    if cancel_scope.cancelled_caught:
-                        logging.warning("extract_community_report._chat timeout, skipping...")
-                        return
+                    async with community_limiter:  # Use community-specific limiter
+                        with trio.move_on_after(150) as cancel_scope:  # Increased timeout
+                            response = await trio.to_thread.run_sync(self._chat, text, [{"role": "user", "content": "Output:"}], gen_conf)
+                        
+                        if cancel_scope.cancelled_caught:
+                            if attempt < max_retries - 1:
+                                logging.warning(f"Community {cm_id} timeout on attempt {attempt + 1}, retrying...")
+                                await trio.sleep(2 ** attempt)  # Exponential backoff
+                                continue
+                            else:
+                                logging.warning(f"Community {cm_id} timeout after {max_retries} attempts, skipping...")
+                                return
+                    
+                    # Successfully got response, break out of retry loop
+                    break
+                    
                 except Exception as e:
-                    logging.error(f"extract_community_report._chat failed: {e}")
-                    return
-            token_count += num_tokens_from_string(text + response)
-            response = re.sub(r"^[^\{]*", "", response)
-            response = re.sub(r"[^\}]*$", "", response)
-            response = re.sub(r"\{\{", "{", response)
-            response = re.sub(r"\}\}", "}", response)
-            logging.debug(response)
+                    error_str = str(e).lower()
+                    
+                    # Check for specific API errors
+                    if any(err in error_str for err in ["auth_subrequest_error", "internal_error", "500", "502", "503", "504"]):
+                        if attempt < max_retries - 1:
+                            wait_time = min(5 * (2 ** attempt), 30)  # Exponential backoff, max 30s
+                            logging.warning(f"Community {cm_id} API error on attempt {attempt + 1}: {str(e)[:100]}... Retrying in {wait_time}s")
+                            await trio.sleep(wait_time)
+                            continue
+                        else:
+                            logging.error(f"Community {cm_id} failed after {max_retries} attempts due to API errors: {str(e)[:100]}...")
+                            return
+                    elif "rate_limit" in error_str or "quota" in error_str:
+                        if attempt < max_retries - 1:
+                            wait_time = min(10 * (2 ** attempt), 60)  # Longer wait for rate limits
+                            logging.warning(f"Community {cm_id} rate limit on attempt {attempt + 1}. Waiting {wait_time}s")
+                            await trio.sleep(wait_time)
+                            continue
+                        else:
+                            logging.error(f"Community {cm_id} failed due to rate limits after {max_retries} attempts")
+                            return
+                    else:
+                        # Other errors, don't retry
+                        logging.error(f"Community {cm_id} failed with non-retryable error: {str(e)[:100]}...")
+                        return
+            
+            # Process response
             try:
-                response = json.loads(response)
-            except json.JSONDecodeError as e:
-                logging.error(f"Failed to parse JSON response: {e}")
-                logging.error(f"Response content: {response}")
+                token_count += num_tokens_from_string(text + response)
+                
+                # Clean and parse JSON response
+                response = re.sub(r"^[^\{]*", "", response)
+                response = re.sub(r"[^\}]*$", "", response)
+                response = re.sub(r"\{\{", "{", response)
+                response = re.sub(r"\}\}", "}", response)
+                logging.debug(f"Community {cm_id} response: {response[:200]}...")
+                
+                try:
+                    response_dict = json.loads(response)
+                except json.JSONDecodeError as e:
+                    logging.error(f"Community {cm_id} JSON parse error: {e}")
+                    logging.error(f"Response content: {response[:500]}...")
+                    return
+                
+                # Validate required fields
+                if not dict_has_keys_with_types(response_dict, [
+                            ("title", str),
+                            ("summary", str),
+                            ("findings", list),
+                            ("rating", (int, float)),
+                            ("rating_explanation", str),
+                        ]):
+                    logging.error(f"Community {cm_id} missing required fields in response")
+                    return
+                
+                # Successfully processed community
+                response_dict["weight"] = weight
+                response_dict["entities"] = ents
+                add_community_info2graph(graph, ents, response_dict["title"])
+                res_str.append(self._get_text_output(response_dict))
+                res_dict.append(response_dict)
+                over += 1
+                
+                if callback:
+                    callback(msg=f"Communities: {over}/{total}, used tokens: {token_count}")
+                    
+            except Exception as e:
+                logging.error(f"Community {cm_id} processing error: {str(e)[:100]}...")
                 return
-            if not dict_has_keys_with_types(response, [
-                        ("title", str),
-                        ("summary", str),
-                        ("findings", list),
-                        ("rating", float),
-                        ("rating_explanation", str),
-                    ]):
-                return
-            response["weight"] = weight
-            response["entities"] = ents
-            add_community_info2graph(graph, ents, response["title"])
-            res_str.append(self._get_text_output(response))
-            res_dict.append(response)
-            over += 1
-            if callback:
-                callback(msg=f"Communities: {over}/{total}, used tokens: {token_count}")
 
         st = trio.current_time()
-        async with trio.open_nursery() as nursery:
-            for level, comm in communities.items():
-                logging.info(f"Level {level}: Community: {len(comm.keys())}")
-                for community in comm.items():
+        
+        # Process communities in batches to avoid overwhelming the API
+        batch_size = int(os.environ.get('COMMUNITY_BATCH_SIZE', 5))
+        all_communities = []
+        for level, comm in communities.items():
+            logging.info(f"Level {level}: Community: {len(comm.keys())}")
+            all_communities.extend(comm.items())
+        
+        # Process communities in batches
+        for batch_start in range(0, len(all_communities), batch_size):
+            batch_end = min(batch_start + batch_size, len(all_communities))
+            current_batch = all_communities[batch_start:batch_end]
+            
+            logging.info(f"Processing community batch {batch_start//batch_size + 1}/{(len(all_communities) + batch_size - 1)//batch_size} ({len(current_batch)} communities)")
+            
+            async with trio.open_nursery() as nursery:
+                for community in current_batch:
                     nursery.start_soon(extract_community_report, community)
+            
+            # Small delay between batches to be gentle on the API
+            if batch_end < len(all_communities):
+                await trio.sleep(1)
+        
         if callback:
             callback(msg=f"Community reports done in {trio.current_time() - st:.2f}s, used tokens: {token_count}")
 

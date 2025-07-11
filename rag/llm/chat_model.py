@@ -1020,8 +1020,10 @@ class GeminiChat(Base):
         self.model._client = _client
 
     def _clean_conf(self, gen_conf):
+        if "max_tokens" in gen_conf:
+            gen_conf["max_output_tokens"] = gen_conf.pop("max_tokens")
         for k in list(gen_conf.keys()):
-            if k not in ["temperature", "top_p", "max_tokens"]:
+            if k not in ["temperature", "top_p", "max_output_tokens"]:
                 del gen_conf[k]
         return gen_conf
 
@@ -1045,8 +1047,45 @@ class GeminiChat(Base):
         if system:
             self.model._system_instruction = content_types.to_content(system)
         response = self.model.generate_content(hist, generation_config=gen_conf)
-        ans = response.text
-        return ans, response.usage_metadata.total_token_count
+        
+        # Safely extract text from response
+        ans = ""
+        try:
+            # Check if response has valid parts and text
+            if hasattr(response, 'candidates') and response.candidates:
+                candidate = response.candidates[0]
+                # Check finish reason before accessing text
+                if hasattr(candidate, 'finish_reason'):
+                    if candidate.finish_reason == 1:  # STOP - normal completion
+                        ans = response.text
+                    elif candidate.finish_reason == 2:  # SAFETY - content filtered
+                        ans = "**ERROR**: CONTENT_FILTERED - Response was blocked by safety filters. Please try rephrasing your request."
+                    elif candidate.finish_reason == 3:  # MAX_TOKENS - length limit
+                        try:
+                            ans = response.text + LENGTH_NOTIFICATION_EN
+                        except:
+                            ans = "**ERROR**: MAX_TOKENS - Response was truncated due to length limits."
+                    elif candidate.finish_reason == 4:  # RECITATION - blocked due to citation
+                        ans = "**ERROR**: CONTENT_FILTERED - Response was blocked due to potential copyright concerns."
+                    else:
+                        ans = f"**ERROR**: UNKNOWN_FINISH_REASON - Unexpected finish reason: {candidate.finish_reason}"
+                else:
+                    # Fallback: try to get text directly
+                    ans = response.text
+            else:
+                ans = "**ERROR**: INVALID_RESPONSE - No valid response candidates returned."
+                
+        except Exception as e:
+            # If all else fails, return a descriptive error
+            ans = f"**ERROR**: RESPONSE_EXTRACTION_FAILED - {str(e)}"
+            
+        token_count = 0
+        try:
+            token_count = response.usage_metadata.total_token_count
+        except:
+            pass
+            
+        return ans, token_count
 
     def chat_streamly(self, system, history, gen_conf):
         from google.generativeai.types import content_types
@@ -1063,10 +1102,44 @@ class GeminiChat(Base):
         try:
             response = self.model.generate_content(history, generation_config=gen_conf, stream=True)
             for resp in response:
-                ans = resp.text
-                yield ans
+                try:
+                    # Safely extract text from streaming response
+                    if hasattr(resp, 'candidates') and resp.candidates:
+                        candidate = resp.candidates[0]
+                        if hasattr(candidate, 'finish_reason'):
+                            if candidate.finish_reason == 2:  # SAFETY - content filtered
+                                ans += "\n**ERROR**: CONTENT_FILTERED - Response was blocked by safety filters."
+                                yield ans
+                                return
+                            elif candidate.finish_reason == 4:  # RECITATION - blocked due to citation
+                                ans += "\n**ERROR**: CONTENT_FILTERED - Response was blocked due to potential copyright concerns."
+                                yield ans
+                                return
+                        
+                        # Try to get text content
+                        if hasattr(resp, 'text') and resp.text:
+                            ans += resp.text
+                            yield resp.text
+                    else:
+                        # No valid candidates, try direct text access
+                        if hasattr(resp, 'text') and resp.text:
+                            ans += resp.text
+                            yield resp.text
+                except ValueError as ve:
+                    # Handle the specific "Invalid operation" error from Gemini
+                    if "response.text" in str(ve) and "finish_reason" in str(ve):
+                        ans += "\n**ERROR**: CONTENT_FILTERED - Response was blocked by safety filters."
+                        yield ans
+                        return
+                    else:
+                        # Other ValueError, re-raise
+                        raise ve
 
-            yield response._chunks[-1].usage_metadata.total_token_count
+            # Try to get token count from the last chunk
+            try:
+                yield response._chunks[-1].usage_metadata.total_token_count
+            except:
+                yield 0
         except Exception as e:
             yield ans + "\n**ERROR**: " + str(e)
 

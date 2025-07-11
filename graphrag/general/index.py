@@ -260,62 +260,116 @@ async def extract_community(
     callback,
 ):
     start = trio.current_time()
-    ext = CommunityReportsExtractor(
-        llm_bdl,
-    )
-    cr = await ext(graph, callback=callback)
-    community_structure = cr.structured_output
-    community_reports = cr.output
-    doc_ids = graph.graph["source_id"]
+    try:
+        ext = CommunityReportsExtractor(
+            llm_bdl,
+        )
+        cr = await ext(graph, callback=callback)
+        community_structure = cr.structured_output
+        community_reports = cr.output
+        doc_ids = graph.graph["source_id"]
 
-    now = trio.current_time()
-    callback(
-        msg=f"Graph extracted {len(cr.structured_output)} communities in {now - start:.2f}s."
-    )
-    start = now
+        now = trio.current_time()
+        callback(
+            msg=f"Graph extracted {len(cr.structured_output)} communities in {now - start:.2f}s."
+        )
+        
+        # If no communities were successfully extracted, don't proceed with indexing
+        if not community_structure:
+            callback(msg="No communities were successfully extracted, skipping indexing.")
+            return [], []
+            
+    except Exception as e:
+        error_msg = f"Community extraction failed: {str(e)[:200]}..."
+        callback(msg=f"[ERROR] {error_msg}")
+        logging.error(f"extract_community failed: {e}")
+        return [], []
+    
+    # Proceed with indexing successful communities
+    start = trio.current_time()
     chunks = []
-    for stru, rep in zip(community_structure, community_reports):
-        obj = {
-            "report": rep,
-            "evidences": "\n".join([f.get("explanation", "") for f in stru["findings"]]),
-        }
-        chunk = {
-            "id": get_uuid(),
-            "docnm_kwd": stru["title"],
-            "title_tks": rag_tokenizer.tokenize(stru["title"]),
-            "content_with_weight": json.dumps(obj, ensure_ascii=False),
-            "content_ltks": rag_tokenizer.tokenize(
-                obj["report"] + " " + obj["evidences"]
-            ),
-            "knowledge_graph_kwd": "community_report",
-            "weight_flt": stru["weight"],
-            "entities_kwd": stru["entities"],
-            "important_kwd": stru["entities"],
-            "kb_id": kb_id,
-            "source_id": list(doc_ids),
-            "available_int": 0,
-        }
-        chunk["content_sm_ltks"] = rag_tokenizer.fine_grained_tokenize(
-            chunk["content_ltks"]
-        )
-        chunks.append(chunk)
+    successful_indexed = 0
+    
+    try:
+        for stru, rep in zip(community_structure, community_reports):
+            try:
+                obj = {
+                    "report": rep,
+                    "evidences": "\n".join([f.get("explanation", "") for f in stru["findings"]]),
+                }
+                chunk = {
+                    "id": get_uuid(),
+                    "docnm_kwd": stru["title"],
+                    "title_tks": rag_tokenizer.tokenize(stru["title"]),
+                    "content_with_weight": json.dumps(obj, ensure_ascii=False),
+                    "content_ltks": rag_tokenizer.tokenize(
+                        obj["report"] + " " + obj["evidences"]
+                    ),
+                    "knowledge_graph_kwd": "community_report",
+                    "weight_flt": stru["weight"],
+                    "entities_kwd": stru["entities"],
+                    "important_kwd": stru["entities"],
+                    "kb_id": kb_id,
+                    "source_id": list(doc_ids),
+                    "available_int": 0,
+                }
+                chunk["content_sm_ltks"] = rag_tokenizer.fine_grained_tokenize(
+                    chunk["content_ltks"]
+                )
+                chunks.append(chunk)
+                successful_indexed += 1
+            except Exception as e:
+                logging.warning(f"Failed to process community '{stru.get('title', 'Unknown')}': {str(e)[:100]}...")
+                continue
 
-    await trio.to_thread.run_sync(
-        lambda: settings.docStoreConn.delete(
-            {"knowledge_graph_kwd": "community_report", "kb_id": kb_id},
-            search.index_name(tenant_id),
-            kb_id,
-        )
-    )
-    es_bulk_size = 4
-    for b in range(0, len(chunks), es_bulk_size):
-        doc_store_result = await trio.to_thread.run_sync(lambda: settings.docStoreConn.insert(chunks[b:b + es_bulk_size], search.index_name(tenant_id), kb_id))
-        if doc_store_result:
-            error_message = f"Insert chunk error: {doc_store_result}, please check log file and Elasticsearch/Infinity status!"
-            raise Exception(error_message)
+        # Delete existing community reports before inserting new ones
+        try:
+            await trio.to_thread.run_sync(
+                lambda: settings.docStoreConn.delete(
+                    {"knowledge_graph_kwd": "community_report", "kb_id": kb_id},
+                    search.index_name(tenant_id),
+                    kb_id,
+                )
+            )
+        except Exception as e:
+            logging.warning(f"Failed to delete existing community reports: {str(e)[:100]}...")
+        
+        # Insert new community reports in batches
+        if chunks:
+            es_bulk_size = 4
+            inserted_count = 0
+            for b in range(0, len(chunks), es_bulk_size):
+                try:
+                    doc_store_result = await trio.to_thread.run_sync(
+                        lambda: settings.docStoreConn.insert(
+                            chunks[b:b + es_bulk_size], 
+                            search.index_name(tenant_id), 
+                            kb_id
+                        )
+                    )
+                    if doc_store_result:
+                        error_message = f"Insert chunk batch error: {doc_store_result}"
+                        logging.warning(error_message)
+                        # Continue with next batch instead of failing completely
+                        continue
+                    else:
+                        inserted_count += len(chunks[b:b + es_bulk_size])
+                except Exception as e:
+                    logging.warning(f"Failed to insert community report batch: {str(e)[:100]}...")
+                    continue
+            
+            now = trio.current_time()
+            callback(
+                msg=f"Graph indexed {inserted_count}/{len(chunks)} communities in {now - start:.2f}s."
+            )
+        else:
+            callback(msg="No community reports to index.")
+            
+    except Exception as e:
+        error_msg = f"Community indexing failed: {str(e)[:200]}..."
+        callback(msg=f"[ERROR] {error_msg}")
+        logging.error(f"Community indexing failed: {e}")
+        # Return what we successfully extracted even if indexing failed
+        return community_structure, community_reports
 
-    now = trio.current_time()
-    callback(
-        msg=f"Graph indexed {len(cr.structured_output)} communities in {now - start:.2f}s."
-    )
     return community_structure, community_reports

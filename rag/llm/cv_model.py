@@ -613,19 +613,97 @@ class GeminiCV(Base):
         img = open(BytesIO(base64.b64decode(b64)))
         input = [prompt, img]
         res = self.model.generate_content(input)
-        return res.text, res.usage_metadata.total_token_count
+        
+        # Safely extract text from response
+        try:
+            # Check if response has valid parts and text
+            if hasattr(res, 'candidates') and res.candidates:
+                candidate = res.candidates[0]
+                # Check finish reason before accessing text
+                if hasattr(candidate, 'finish_reason'):
+                    if candidate.finish_reason == 1:  # STOP - normal completion
+                        ans = res.text
+                    elif candidate.finish_reason == 2:  # SAFETY - content filtered
+                        ans = "Unable to describe image due to safety restrictions."
+                    elif candidate.finish_reason == 3:  # MAX_TOKENS - length limit
+                        try:
+                            ans = res.text + "... (description truncated)"
+                        except:
+                            ans = "Description truncated due to length limits."
+                    elif candidate.finish_reason == 4:  # RECITATION - blocked due to citation
+                        ans = "Unable to describe image due to potential copyright concerns."
+                    else:
+                        ans = "Unable to describe image due to processing limitations."
+                else:
+                    # Fallback: try to get text directly
+                    ans = res.text
+            else:
+                ans = "Unable to process image - no valid response."
+                
+        except Exception as e:
+            # If all else fails, return a descriptive error
+            ans = f"Image description failed: {str(e)}"
+            
+        token_count = 0
+        try:
+            token_count = res.usage_metadata.total_token_count
+        except:
+            pass
+            
+        return ans, token_count
 
     def describe_with_prompt(self, image, prompt=None):
         from PIL.Image import open
 
         b64 = self.image2base64(image)
-        vision_prompt = self.vision_llm_prompt(b64, prompt) if prompt else self.vision_llm_prompt(b64)
+        # For Gemini, we need just the text prompt, not the OpenAI-style structure
+        if prompt:
+            prompt_text = prompt
+        else:
+            from rag.prompts import vision_llm_describe_prompt
+            prompt_text = vision_llm_describe_prompt()
+        
         img = open(BytesIO(base64.b64decode(b64)))
-        input = [vision_prompt, img]
-        res = self.model.generate_content(
-            input,
-        )
-        return res.text, res.usage_metadata.total_token_count
+        input = [prompt_text, img]
+        res = self.model.generate_content(input)
+        
+        # Safely extract text from response
+        try:
+            # Check if response has valid parts and text
+            if hasattr(res, 'candidates') and res.candidates:
+                candidate = res.candidates[0]
+                # Check finish reason before accessing text
+                if hasattr(candidate, 'finish_reason'):
+                    if candidate.finish_reason == 1:  # STOP - normal completion
+                        ans = res.text
+                    elif candidate.finish_reason == 2:  # SAFETY - content filtered
+                        ans = "Unable to describe image due to safety restrictions."
+                    elif candidate.finish_reason == 3:  # MAX_TOKENS - length limit
+                        try:
+                            ans = res.text + "... (description truncated)"
+                        except:
+                            ans = "Description truncated due to length limits."
+                    elif candidate.finish_reason == 4:  # RECITATION - blocked due to citation
+                        ans = "Unable to describe image due to potential copyright concerns."
+                    else:
+                        ans = "Unable to describe image due to processing limitations."
+                else:
+                    # Fallback: try to get text directly
+                    ans = res.text
+            else:
+                ans = "Unable to process image - no valid response."
+                
+        except Exception as e:
+            # If all else fails, return a descriptive error
+            ans = f"Image description failed: {str(e)}"
+            
+        token_count = 0
+        try:
+            token_count = res.usage_metadata.total_token_count
+        except:
+            pass
+            
+        return ans, token_count
 
     def chat(self, system, history, gen_conf, image=""):
         from transformers import GenerationConfig
@@ -645,8 +723,43 @@ class GeminiCV(Base):
 
             response = self.model.generate_content(history, generation_config=GenerationConfig(temperature=gen_conf.get("temperature", 0.3), top_p=gen_conf.get("top_p", 0.7)))
 
-            ans = response.text
-            return ans, response.usage_metadata.total_token_count
+            # Safely extract text from response
+            try:
+                # Check if response has valid parts and text
+                if hasattr(response, 'candidates') and response.candidates:
+                    candidate = response.candidates[0]
+                    # Check finish reason before accessing text
+                    if hasattr(candidate, 'finish_reason'):
+                        if candidate.finish_reason == 1:  # STOP - normal completion
+                            ans = response.text
+                        elif candidate.finish_reason == 2:  # SAFETY - content filtered
+                            ans = "Response blocked by safety filters. Please try rephrasing your request."
+                        elif candidate.finish_reason == 3:  # MAX_TOKENS - length limit
+                            try:
+                                ans = response.text + "... (response truncated)"
+                            except:
+                                ans = "Response truncated due to length limits."
+                        elif candidate.finish_reason == 4:  # RECITATION - blocked due to citation
+                            ans = "Response blocked due to potential copyright concerns."
+                        else:
+                            ans = "Unable to generate response due to processing limitations."
+                    else:
+                        # Fallback: try to get text directly
+                        ans = response.text
+                else:
+                    ans = "No valid response generated."
+                    
+            except Exception as e:
+                # If all else fails, return a descriptive error
+                ans = f"Response extraction failed: {str(e)}"
+                
+            token_count = 0
+            try:
+                token_count = response.usage_metadata.total_token_count
+            except:
+                pass
+                
+            return ans, token_count
         except Exception as e:
             return "**ERROR**: " + str(e), 0
 
@@ -675,14 +788,49 @@ class GeminiCV(Base):
             )
 
             for resp in response:
-                if not resp.text:
+                try:
+                    # Safely extract text from streaming response
+                    if hasattr(resp, 'candidates') and resp.candidates:
+                        candidate = resp.candidates[0]
+                        if hasattr(candidate, 'finish_reason'):
+                            if candidate.finish_reason == 2:  # SAFETY - content filtered
+                                ans += "\nResponse blocked by safety filters."
+                                yield ans
+                                return
+                            elif candidate.finish_reason == 4:  # RECITATION - blocked due to citation
+                                ans += "\nResponse blocked due to potential copyright concerns."
+                                yield ans
+                                return
+                        
+                        # Try to get text content
+                        if hasattr(resp, 'text') and resp.text:
+                            ans += resp.text
+                            yield resp.text
+                    else:
+                        # No valid candidates, try direct text access
+                        if hasattr(resp, 'text') and resp.text:
+                            ans += resp.text
+                            yield resp.text
+                except ValueError as ve:
+                    # Handle the specific "Invalid operation" error from Gemini
+                    if "response.text" in str(ve) and "finish_reason" in str(ve):
+                        ans += "\nResponse blocked by safety filters."
+                        yield ans
+                        return
+                    else:
+                        # Other ValueError, re-raise
+                        raise ve
+                except Exception as e:
+                    # Other exceptions, continue processing
                     continue
-                ans += resp.text
-                yield ans
         except Exception as e:
             yield ans + "\n**ERROR**: " + str(e)
 
-        yield response._chunks[-1].usage_metadata.total_token_count
+        # Try to get token count from the last chunk
+        try:
+            yield response._chunks[-1].usage_metadata.total_token_count
+        except:
+            yield 0
 
 
 class OpenRouterCV(GptV4):

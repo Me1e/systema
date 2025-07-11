@@ -49,8 +49,29 @@ class RecursiveAbstractiveProcessing4TreeOrganizedRetrieval:
             lambda: self._llm_model.chat(system, history, gen_conf)
         )
         response = re.sub(r"^.*</think>", "", response, flags=re.DOTALL)
+        
+        # Enhanced error handling
         if response.find("**ERROR**") >= 0:
-            raise Exception(response)
+            # Check for specific error types that we can handle gracefully
+            if "CONTENT_FILTERED" in response:
+                # For content filtering, try a simplified summarization
+                simplified_content = history[0]["content"].replace(self._prompt.format(cluster_content=""), "").strip()
+                if simplified_content:
+                    # Return a basic summary instead of failing
+                    return f"Summary of content: {simplified_content[:self._max_token//2]}..."
+                else:
+                    return "Unable to summarize content due to safety restrictions."
+            elif "MAX_TOKENS" in response or "RESPONSE_EXTRACTION_FAILED" in response:
+                # For token limit issues, return a truncated response
+                clean_response = re.sub(r"\*\*ERROR\*\*.*", "", response).strip()
+                if clean_response:
+                    return clean_response
+                else:
+                    return "Summary truncated due to length limitations."
+            else:
+                # For other errors, raise the exception as before
+                raise Exception(response)
+        
         set_llm_cache(self._llm_model.llm_name, system, response, history, gen_conf)
         return response
 
